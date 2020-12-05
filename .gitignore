@@ -4,3 +4,5 @@
 /vertices.png
 /skeleton.png
 /classified_skeleton.png
+/node_modules
+/dist

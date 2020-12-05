@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+    <head>
+        <title>MCCode Scanner</title>
+    </head>
+    <body style="height: 100%; margin: 0">
+        <video id="video" hidden></video>
+        <div style="position: absolute;
+                    width: 100%;
+                    height: 100%;
+                    display: grid;
+                    grid-template-rows: 75% 20% 5%;
+                    grid-template-columns: 100%">
+            <canvas
+                id="canvas"
+                style="grid-row: 1;
+                       width: 100%;
+                       height: 100%;
+                       object-fit: contain"
+            ></canvas>
+            <textarea
+                id="result"
+                style="grid-row: 2;
+                       width: 100%;
+                       height: 100%;
+                       box-sizing: border-box;
+                       border-width: 3px;
+                       font-size: 3vh;"
+            ></textarea>
+            <button
+                id="rescan"
+                style="grid-row: 3;
+                       width: 100%;
+                       height: 100%;
+                       font-size: 3vh;"
+            >再スキャン</button>
+        </div>
+        <script src="index.js"></script>
+    </body>
+</html>

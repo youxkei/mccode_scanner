@@ -1,0 +1,35 @@
+{
+  "name": "mccode_scanner",
+  "version": "0.0.1",
+  "description": "MCCode Scanner",
+  "main": "index.js",
+  "directories": {
+    "example": "example"
+  },
+  "scripts": {
+    "build": "rimraf dist pkg && webpack",
+    "start": "rimraf dist pkg && webpack-dev-server --open -d",
+    "deploy": "npm run build && gh-pages -d dist",
+    "test": "cargo test && wasm-pack test --headless"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/youxkei/mccode_scanner.git"
+  },
+  "author": "youxkei <youxkei@gmail.com>",
+  "license": "CC0-1.0",
+  "bugs": {
+    "url": "https://github.com/youxkei/mccode_scanner/issues"
+  },
+  "homepage": "https://github.com/youxkei/mccode_scanner#readme",
+  "devDependencies": {
+    "@wasm-tool/wasm-pack-plugin": "^1.3.1",
+    "@webpack-cli/serve": "^1.1.0",
+    "copy-webpack-plugin": "^6.3.2",
+    "gh-pages": "^3.1.0",
+    "rimraf": "^3.0.2",
+    "webpack": "^4.44.2",
+    "webpack-cli": "^3.3.12",
+    "webpack-dev-server": "^3.11.0"
+  }
+}

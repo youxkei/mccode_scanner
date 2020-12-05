@@ -33,7 +33,7 @@ const PORT_PIXEL: u8 = 200;
 const CROSSING_PIXEL: u8 = 199;
 const EDGE_PIXEL: u8 = 127;
 
-pub fn scan(image: DynamicImage, intermediate: bool) -> String {
+pub fn scan(image: DynamicImage, intermediate: bool) -> Result<String, String> {
     let image = grayscale(&image);
 
     if intermediate {
@@ -44,7 +44,6 @@ pub fn scan(image: DynamicImage, intermediate: bool) -> String {
     let opening_number = calculate_opening_number(&binary_image);
 
     invert(&mut binary_image);
-    //let binary_image = framing(close(binary_image, 5));
     let binary_image = framing(binary_image);
 
     if intermediate {
@@ -64,7 +63,7 @@ pub fn scan(image: DynamicImage, intermediate: bool) -> String {
     }
 
     let (classified_skeleton_image, port_pixels) =
-        classify_edge_pixels(skeleton_image, &vertices_segment_image);
+        classify_edge_pixels(skeleton_image, &vertices_segment_image)?;
 
     if intermediate {
         classified_skeleton_image
@@ -74,12 +73,12 @@ pub fn scan(image: DynamicImage, intermediate: bool) -> String {
 
     let port_pixels = unify_port_pixels(&classified_skeleton_image, port_pixels);
 
-    let adjacency_map = calculate_adjacency_map(&classified_skeleton_image, &port_pixels);
+    let adjacency_map = calculate_adjacency_map(&classified_skeleton_image, &port_pixels)?;
 
-    let bits = extract_bits(&adjacency_map);
+    let bits = extract_bits(&adjacency_map)?;
     let data = decode_bits(bits);
 
-    data
+    Ok(data)
 }
 
 fn calculate_opening_number(image: &GrayImage) -> u8 {
@@ -294,7 +293,7 @@ fn hilditch_thinning(image: GrayImage) -> GrayImage {
 fn classify_edge_pixels(
     skeleton_image: GrayImage,
     vertices_segment_image: &GrayImage,
-) -> (GrayImage, PortPixels) {
+) -> Result<(GrayImage, PortPixels), String> {
     let mut vertex_id = 1;
     let (width, height) = skeleton_image.dimensions();
     let mut skeleton_image = skeleton_image;
@@ -327,13 +326,12 @@ fn classify_edge_pixels(
             } else if num_foreground_skeleton_neighbors == 2 {
                 skeleton_image.put_pixel(x, y, Luma([EDGE_PIXEL]))
             } else if num_foreground_skeleton_neighbors > 2 {
-                println!("crossing pixel ({:?}, {:?})", x, y);
-                skeleton_image.put_pixel(x, y, Luma([CROSSING_PIXEL]))
+                return Err(format!("crossing pixel ({:?}, {:?})", x, y));
             }
         }
     }
 
-    (skeleton_image, port_pixels)
+    Ok((skeleton_image, port_pixels))
 }
 
 fn bit_and_four_neighbors(lhs: FourNeighbors, rhs: FourNeighbors) -> FourNeighbors {
@@ -471,7 +469,10 @@ fn unify_port_pixels_test() {
     );
 }
 
-fn calculate_adjacency_map(skeleton_image: &GrayImage, port_pixels: &PortPixels) -> AdjacencyMap {
+fn calculate_adjacency_map(
+    skeleton_image: &GrayImage,
+    port_pixels: &PortPixels,
+) -> Result<AdjacencyMap, String> {
     let mut adjacency_list: AdjacencyMap = HashMap::new();
     let mut visited = HashSet::new();
 
@@ -497,14 +498,22 @@ fn calculate_adjacency_map(skeleton_image: &GrayImage, port_pixels: &PortPixels)
         let mut current_pixel = *src_pixel;
 
         loop {
+            let mut moved = false;
+
             for neighbor in &four_neighbors(&skeleton_image, current_pixel.0, current_pixel.1) {
                 if neighbor.0 != prev_pixel
                     && (neighbor.1 == EDGE_PIXEL || neighbor.1 == PORT_PIXEL)
                 {
                     prev_pixel = current_pixel;
                     current_pixel = neighbor.0;
+
+                    moved = true;
                     break;
                 }
+            }
+
+            if !moved {
+                return Err(format!("dead end edge on pixel: {:?}", current_pixel));
             }
 
             if skeleton_image.get_pixel(current_pixel.0, current_pixel.1)[0] == PORT_PIXEL {
@@ -516,6 +525,10 @@ fn calculate_adjacency_map(skeleton_image: &GrayImage, port_pixels: &PortPixels)
                     .borrow()
                     .clone_data();
 
+                if dst_pixel_index == src_pixel_index {
+                    return Err(format!("there is a loop on vertex: {:?}", current_pixel));
+                }
+
                 let mut dst_adjacents = adjacency_list.get(&dst_pixel_index).unwrap().borrow_mut();
 
                 *(src_adjacents.entry(dst_pixel_index).or_insert(0)) += 1;
@@ -526,7 +539,7 @@ fn calculate_adjacency_map(skeleton_image: &GrayImage, port_pixels: &PortPixels)
         }
     }
 
-    adjacency_list
+    Ok(adjacency_list)
 }
 
 fn four_neighbors(image: &GrayImage, x: u32, y: u32) -> FourNeighbors {
@@ -649,14 +662,14 @@ fn calculate_adjacency_map_test() {
     }
 }
 
-fn extract_bits(adjacency_map: &AdjacencyMap) -> Vec<u8> {
+fn extract_bits(adjacency_map: &AdjacencyMap) -> Result<Vec<u8>, String> {
     let mut visited = hashset!();
     let mut density = 0;
     let mut bits = vec![];
     let mut layer_index = 1;
 
     let (center_vertex, mut base_vertex, mut direction_vertex) =
-        find_marker_vertices(adjacency_map);
+        find_marker_vertices(adjacency_map)?;
     visited.insert(center_vertex);
 
     loop {
@@ -725,10 +738,12 @@ fn extract_bits(adjacency_map: &AdjacencyMap) -> Vec<u8> {
         }
     }
 
-    bits
+    Ok(bits)
 }
 
-fn find_marker_vertices(adjacency_map: &AdjacencyMap) -> (VertexId, VertexId, VertexId) {
+fn find_marker_vertices(
+    adjacency_map: &AdjacencyMap,
+) -> Result<(VertexId, VertexId, VertexId), String> {
     for (src, adjacents) in adjacency_map {
         let adjacents = adjacents.borrow();
 
@@ -747,14 +762,14 @@ fn find_marker_vertices(adjacency_map: &AdjacencyMap) -> (VertexId, VertexId, Ve
                 }
 
                 match adjacents.get(direction_vertex) {
-                    Some(1) => return (*src, *dst, *direction_vertex),
+                    Some(1) => return Ok((*src, *dst, *direction_vertex)),
                     _ => {}
                 }
             }
         }
     }
 
-    panic!("invalid MC code: cannot find center vertex")
+    Err("invalid MC code: cannot find center vertex".to_string())
 }
 
 #[derive(PartialEq)]
@@ -1078,36 +1093,38 @@ fn decode_bits(bits: Vec<u8>) -> String {
     let mut bytes = vec![];
 
     match decode_four_bits(&bits[0..4]) {
-        0 => {
-            let data_bits = demask(&mut bits[4..]);
+        0 => match demask(&mut bits[4..]) {
+            Ok(data_bits) => {
+                for chunk in data_bits.chunks(8) {
+                    if chunk.len() < 8 {
+                        break;
+                    }
 
-            for chunk in data_bits.chunks(8) {
-                if chunk.len() < 8 {
-                    break;
+                    let byte = decode_eight_bits(chunk);
+
+                    if byte == 0 {
+                        break;
+                    }
+
+                    bytes.push(byte);
                 }
-
-                let byte = decode_eight_bits(chunk);
-
-                if byte == 0 {
-                    break;
-                }
-
-                bytes.push(byte);
             }
-        }
 
-        n => panic!("unsupported MC code version {:?}", n),
+            Err(error) => return error,
+        },
+
+        n => return format!("unsupported MC code version {:?}", n),
     }
 
     match String::from_utf8(bytes) {
         Ok(string) => string,
-        Err(error) => panic!("invalid UTF8 string. error: {:?}", error),
+        Err(error) => format!("invalid UTF8 string. error: {:?}", error),
     }
 }
 
-fn demask(bits: &mut [u8]) -> &[u8] {
+fn demask(bits: &mut [u8]) -> Result<&[u8], String> {
     match decode_four_bits(&bits[0..4]) {
-        0 => &bits[4..],
+        0 => Ok(&bits[4..]),
 
         1 => {
             for (i, bit) in bits[4..].iter_mut().enumerate() {
@@ -1116,10 +1133,10 @@ fn demask(bits: &mut [u8]) -> &[u8] {
                 }
             }
 
-            &bits[4..]
+            Ok(&bits[4..])
         }
 
-        n => panic!("unsupported MC code mask pattern {:?}", n),
+        n => Err(format!("unsupported MC code mask pattern {:?}", n)),
     }
 }
 

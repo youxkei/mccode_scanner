@@ -20,7 +20,7 @@ struct Opt {
 fn main() {
     let opt = Opt::from_args();
     println!(
-        "{}",
+        "{:?}",
         scanner::scan(image::open(opt.input).unwrap(), opt.intermediate)
     );
 }
