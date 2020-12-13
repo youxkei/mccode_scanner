@@ -67,6 +67,7 @@
     }
 
     rescan.addEventListener("click", () => {
+      result.textContent = "";
       window.requestAnimationFrame(main);
     });
 
