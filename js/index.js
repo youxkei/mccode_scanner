@@ -8,12 +8,12 @@
 
   const context = canvas.getContext("2d");
 
-  const scanWidth = 240;
+  const scanWidth = 360;
   const constraint = {
     video: {
       facingMode: { exact: "environment" },
-      width: { exact: 640 },
-      height: { exact: 480 },
+      width: { exact: (scanWidth * 8) / 3 },
+      height: { exact: scanWidth * 2 },
     },
     audio: false,
   };
