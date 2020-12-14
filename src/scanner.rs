@@ -424,7 +424,7 @@ fn unify_port_pixels_test() {
     );
 
     let (skeleton_image, port_pixels) =
-        classify_edge_pixels(skeleton_image, &vertices_segment_image);
+        classify_edge_pixels(skeleton_image, &vertices_segment_image).unwrap();
 
     let port_pixels = unify_port_pixels(&skeleton_image, port_pixels);
 
@@ -596,7 +596,7 @@ fn calculate_adjacency_map_test() {
 
         assert_eq!(
             expected_adjacency_map,
-            calculate_adjacency_map(&skeleton_image, &port_pixels)
+            calculate_adjacency_map(&skeleton_image, &port_pixels).unwrap()
         )
     }
     {
@@ -657,7 +657,7 @@ fn calculate_adjacency_map_test() {
 
         assert_eq!(
             expected_adjacency_map,
-            calculate_adjacency_map(&skeleton_image, &port_pixels)
+            calculate_adjacency_map(&skeleton_image, &port_pixels).unwrap()
         )
     }
 }
