@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use image::imageops::colorops::{grayscale, invert};
 use image::{DynamicImage, GrayImage, Luma};
 
-use imageproc::contrast::{otsu_level, threshold};
+use imageproc::contrast::{otsu_level, threshold_mut};
 use imageproc::distance_transform::{distance_transform, Norm};
 use imageproc::morphology::{dilate_mut, erode_mut};
+use imageproc::stats::histogram;
 
 use disjoint_sets::UnionFindNode;
 
@@ -33,6 +34,8 @@ const PORT_PIXEL: u8 = 200;
 const CROSSING_PIXEL: u8 = 199;
 const EDGE_PIXEL: u8 = 127;
 
+const MAX_FOREGROUND_PERCENTAGE: u32 = 35;
+
 pub fn scan(image: DynamicImage, intermediate: bool) -> Result<String, String> {
     let image = grayscale(&image);
 
@@ -49,6 +52,8 @@ pub fn scan(image: DynamicImage, intermediate: bool) -> Result<String, String> {
     if intermediate {
         binary_image.save("binary.png").unwrap();
     }
+
+    check_foreground_percentage(&binary_image)?;
 
     let vertices_segment_image = open(binary_image.clone(), opening_number);
 
@@ -101,8 +106,11 @@ fn calculate_opening_number(image: &GrayImage) -> u8 {
 }
 
 fn thresholding(image: GrayImage) -> GrayImage {
+    let mut image = image;
     let threshold_level = otsu_level(&image);
-    threshold(&image, threshold_level)
+    threshold_mut(&mut image, threshold_level);
+
+    image
 }
 
 fn framing(image: GrayImage) -> GrayImage {
@@ -124,6 +132,23 @@ fn framing(image: GrayImage) -> GrayImage {
     }
 
     image
+}
+
+fn check_foreground_percentage(image: &GrayImage) -> Result<(), String> {
+    let hist = histogram(image).channels[0];
+    let num_foreground_pixels = hist[FOREGROUND_PIXEL as usize];
+    let num_pixels = num_foreground_pixels + hist[BACKGROUND_PIXEL as usize];
+
+    // num_foreground_pixels / num_pixels <= MAX_FOREGROUND_PERCENTAGE / 100
+    if num_foreground_pixels * 100 <= MAX_FOREGROUND_PERCENTAGE * num_pixels {
+        Ok(())
+    } else {
+        Err(format!(
+            "foregroud percentage is too high. percentage: {:.2}, required: percentage <= {}",
+            num_foreground_pixels as f64 / num_pixels as f64 * 100.0,
+            MAX_FOREGROUND_PERCENTAGE
+        ))
+    }
 }
 
 fn open(image: GrayImage, k: u8) -> GrayImage {
