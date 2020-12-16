@@ -14,6 +14,8 @@ use disjoint_sets::UnionFindNode;
 use maplit::hashset;
 
 #[cfg(test)]
+use imageproc::assert_pixels_eq;
+#[cfg(test)]
 use imageproc::gray_image;
 #[cfg(test)]
 use maplit::hashmap;
@@ -31,7 +33,7 @@ const REMOVING_PIXEL: u8 = 127;
 const FOREGROUND_PIXEL: u8 = 255;
 
 const PORT_PIXEL: u8 = 200;
-const CROSSING_PIXEL: u8 = 199;
+const CROSSING_PIXEL: u8 = 160;
 const EDGE_PIXEL: u8 = 127;
 
 const MAX_FOREGROUND_PERCENTAGE: u32 = 35;
@@ -76,9 +78,18 @@ pub fn scan(image: DynamicImage, intermediate: bool) -> Result<String, String> {
             .unwrap();
     }
 
-    let port_pixels = unify_port_pixels(&classified_skeleton_image, port_pixels);
+    let (classified_skeleton_image, port_pixels) =
+        unify_port_pixels(classified_skeleton_image, port_pixels, opening_number)?;
+
+    if intermediate {
+        classified_skeleton_image
+            .save("modified_classified_skeleton.png")
+            .unwrap();
+    }
 
     let adjacency_map = calculate_adjacency_map(&classified_skeleton_image, &port_pixels)?;
+
+    println!("{:?}", adjacency_map);
 
     let bits = extract_bits(&adjacency_map)?;
     let data = decode_bits(bits);
@@ -105,16 +116,14 @@ fn calculate_opening_number(image: &GrayImage) -> u8 {
     max_distance / 2
 }
 
-fn thresholding(image: GrayImage) -> GrayImage {
-    let mut image = image;
+fn thresholding(mut image: GrayImage) -> GrayImage {
     let threshold_level = otsu_level(&image);
     threshold_mut(&mut image, threshold_level);
 
     image
 }
 
-fn framing(image: GrayImage) -> GrayImage {
-    let mut image = image;
+fn framing(mut image: GrayImage) -> GrayImage {
     let (width, height) = image.dimensions();
 
     for y in 0..height {
@@ -151,13 +160,10 @@ fn check_foreground_percentage(image: &GrayImage) -> Result<(), String> {
     }
 }
 
-fn open(image: GrayImage, k: u8) -> GrayImage {
-    let mut image = image;
-
+fn open(mut image: GrayImage, k: u8) -> GrayImage {
     erode_mut(&mut image, Norm::L1, k);
 
-    // FIXME
-    dilate_mut(&mut image, Norm::LInf, k + k / 2);
+    dilate_mut(&mut image, Norm::L1, k + 2);
 
     image
 }
@@ -319,7 +325,7 @@ fn classify_edge_pixels(
     skeleton_image: GrayImage,
     vertices_segment_image: &GrayImage,
 ) -> Result<(GrayImage, PortPixels), String> {
-    let mut vertex_id = 1;
+    let mut port_pixel_id = 1;
     let (width, height) = skeleton_image.dimensions();
     let mut skeleton_image = skeleton_image;
     let mut port_pixels = HashMap::new();
@@ -344,14 +350,14 @@ fn classify_edge_pixels(
 
             if num_foreground_skeleton_neighbors_inside_vertices > 0 {
                 skeleton_image.put_pixel(x, y, Luma([PORT_PIXEL]));
-                port_pixels.insert((x, y), RefCell::new(UnionFindNode::new(vertex_id)));
-                vertex_id += 1;
+                port_pixels.insert((x, y), RefCell::new(UnionFindNode::new(port_pixel_id)));
+                port_pixel_id += 1;
             } else if num_foreground_skeleton_neighbors < 2 {
                 skeleton_image.put_pixel(x, y, Luma([0]))
             } else if num_foreground_skeleton_neighbors == 2 {
                 skeleton_image.put_pixel(x, y, Luma([EDGE_PIXEL]))
             } else if num_foreground_skeleton_neighbors > 2 {
-                return Err(format!("crossing pixel ({:?}, {:?})", x, y));
+                skeleton_image.put_pixel(x, y, Luma([CROSSING_PIXEL]))
             }
         }
     }
@@ -388,9 +394,14 @@ fn num_foreground_four_neighbors(neighbors: FourNeighbors) -> u32 {
     return count;
 }
 
-fn unify_port_pixels(skeleton_image: &GrayImage, port_pixels: PortPixels) -> PortPixels {
+fn unify_port_pixels(
+    mut skeleton_image: GrayImage,
+    mut port_pixels: PortPixels,
+    opening_number: u8,
+) -> Result<(GrayImage, PortPixels), String> {
     let mut visited = HashSet::new();
 
+    // unifying port pixels belonging to the same vertex
     for (port_pixel, port_pixel_node) in &port_pixels {
         if visited.contains(&*port_pixel) {
             continue;
@@ -413,7 +424,7 @@ fn unify_port_pixels(skeleton_image: &GrayImage, port_pixels: PortPixels) -> Por
                 _ => {
                     let (x, y) = pixel;
 
-                    for neighbor in &four_neighbors(skeleton_image, x, y) {
+                    for neighbor in &four_neighbors(&skeleton_image, x, y) {
                         if neighbor.1 >= PORT_PIXEL && !visited.contains(&neighbor.0) {
                             next_pixels.push(neighbor.0)
                         }
@@ -423,75 +434,256 @@ fn unify_port_pixels(skeleton_image: &GrayImage, port_pixels: PortPixels) -> Por
         }
     }
 
-    port_pixels
+    // collecting crossing pixel close to some port pixel along edges
+    // the distance should be equal or less than opening_number * 2
+    let mut crossing_pixels_close_to_port_pixel = vec![];
+    let max_distance = opening_number * 2;
+
+    for (port_pixel, port_pixel_node) in &port_pixels {
+        for port_pixel_neighbor in &four_neighbors(&skeleton_image, port_pixel.0, port_pixel.1) {
+            if !(port_pixel_neighbor.1 == EDGE_PIXEL
+                || port_pixel_neighbor.1 == PORT_PIXEL
+                || port_pixel_neighbor.1 == CROSSING_PIXEL)
+            {
+                continue;
+            }
+
+            let mut current_pixel = port_pixel_neighbor.0;
+            let mut prev_pixel = *port_pixel;
+
+            for _ in 0..max_distance {
+                match skeleton_image.get_pixel(current_pixel.0, current_pixel.1)[0] {
+                    CROSSING_PIXEL => {
+                        crossing_pixels_close_to_port_pixel
+                            .push((current_pixel, port_pixel_node.clone()));
+
+                        break;
+                    }
+
+                    PORT_PIXEL => break,
+
+                    _ => {}
+                }
+
+                let mut moved = false;
+
+                for neighbor in &four_neighbors(&skeleton_image, current_pixel.0, current_pixel.1) {
+                    if neighbor.0 != prev_pixel
+                        && (neighbor.1 == EDGE_PIXEL
+                            || neighbor.1 == PORT_PIXEL
+                            || neighbor.1 == CROSSING_PIXEL)
+                    {
+                        prev_pixel = current_pixel;
+                        current_pixel = neighbor.0;
+
+                        moved = true;
+                        break;
+                    }
+                }
+
+                if !moved {
+                    return Err(format!(
+                        "unify_port_pixels: dead end edge on pixel: {:?}",
+                        current_pixel
+                    ));
+                }
+            }
+        }
+    }
+
+    for (crossing_pixel, port_pixel_node) in crossing_pixels_close_to_port_pixel {
+        port_pixels.insert(crossing_pixel, port_pixel_node);
+        skeleton_image.put_pixel(crossing_pixel.0, crossing_pixel.1, Luma([PORT_PIXEL]));
+    }
+
+    Ok((skeleton_image, port_pixels))
 }
 
 #[test]
 fn unify_port_pixels_test() {
-    let vertices_segment_image = gray_image!(
-        0, 0,                0, 0, 0, 0,                0;
-        0, FOREGROUND_PIXEL, 0, 0, 0, FOREGROUND_PIXEL, 0;
-        0, 0,                0, 0, 0, 0,                0;
-        0, 0,                0, 0, 0, 0,                0;
-        0, 0,                0, 0, 0, 0,                0;
-        0, FOREGROUND_PIXEL, 0, 0, 0, FOREGROUND_PIXEL, 0;
-        0, 0,                0, 0, 0, 0,                0
-    );
+    const F: u8 = FOREGROUND_PIXEL;
+    const P: u8 = PORT_PIXEL;
+    const C: u8 = CROSSING_PIXEL;
+    const E: u8 = EDGE_PIXEL;
 
-    let skeleton_image = gray_image!(
-        0, 0,                0,                0,                0,                0,                0;
-        0, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0;
-        0, FOREGROUND_PIXEL, 0,                0,                0,                FOREGROUND_PIXEL, 0;
-        0, FOREGROUND_PIXEL, 0,                0,                0,                FOREGROUND_PIXEL, 0;
-        0, FOREGROUND_PIXEL, 0,                0,                0,                FOREGROUND_PIXEL, 0;
-        0, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0;
-        0, 0,                0,                0,                0,                0,                0
-    );
+    {
+        let skeleton_image = gray_image!(
+            0, 0, 0, 0, 0, 0, 0;
+            0, F, P, E, P, F, 0;
+            0, P, 0, 0, 0, P, 0;
+            0, E, 0, 0, 0, E, 0;
+            0, P, 0, 0, 0, P, 0;
+            0, F, P, E, P, F, 0;
+            0, 0, 0, 0, 0, 0, 0
+        );
 
-    let (skeleton_image, port_pixels) =
-        classify_edge_pixels(skeleton_image, &vertices_segment_image).unwrap();
+        let port_pixels = hashmap!(
+            (2, 1) => RefCell::new(UnionFindNode::new(1)),
+            (1, 2) => RefCell::new(UnionFindNode::new(1)),
 
-    let port_pixels = unify_port_pixels(&skeleton_image, port_pixels);
+            (4, 1) => RefCell::new(UnionFindNode::new(2)),
+            (5, 2) => RefCell::new(UnionFindNode::new(2)),
 
-    assert_eq!(
-        port_pixels.get(&(2, 1)).unwrap().borrow().clone_data(),
-        port_pixels.get(&(1, 2)).unwrap().borrow().clone_data(),
-    );
+            (1, 4) => RefCell::new(UnionFindNode::new(3)),
+            (2, 5) => RefCell::new(UnionFindNode::new(3)),
 
-    assert_eq!(
-        port_pixels.get(&(4, 1)).unwrap().borrow().clone_data(),
-        port_pixels.get(&(5, 2)).unwrap().borrow().clone_data(),
-    );
+            (5, 4) => RefCell::new(UnionFindNode::new(4)),
+            (4, 5) => RefCell::new(UnionFindNode::new(4)),
+        );
 
-    assert_eq!(
-        port_pixels.get(&(1, 4)).unwrap().borrow().clone_data(),
-        port_pixels.get(&(2, 5)).unwrap().borrow().clone_data(),
-    );
+        let (modified_skeleton_image, port_pixels) =
+            unify_port_pixels(skeleton_image.clone(), port_pixels, 2).unwrap();
 
-    assert_eq!(
-        port_pixels.get(&(5, 4)).unwrap().borrow().clone_data(),
-        port_pixels.get(&(4, 5)).unwrap().borrow().clone_data(),
-    );
+        assert_eq!(
+            port_pixels.get(&(2, 1)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(1, 2)).unwrap().borrow().clone_data(),
+        );
 
-    assert_ne!(
-        port_pixels.get(&(2, 1)).unwrap().borrow().clone_data(),
-        port_pixels.get(&(4, 1)).unwrap().borrow().clone_data(),
-    );
+        assert_eq!(
+            port_pixels.get(&(4, 1)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(5, 2)).unwrap().borrow().clone_data(),
+        );
 
-    assert_ne!(
-        port_pixels.get(&(1, 2)).unwrap().borrow().clone_data(),
-        port_pixels.get(&(1, 4)).unwrap().borrow().clone_data(),
-    );
+        assert_eq!(
+            port_pixels.get(&(1, 4)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(2, 5)).unwrap().borrow().clone_data(),
+        );
 
-    assert_ne!(
-        port_pixels.get(&(5, 2)).unwrap().borrow().clone_data(),
-        port_pixels.get(&(5, 4)).unwrap().borrow().clone_data(),
-    );
+        assert_eq!(
+            port_pixels.get(&(5, 4)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(4, 5)).unwrap().borrow().clone_data(),
+        );
 
-    assert_ne!(
-        port_pixels.get(&(2, 5)).unwrap().borrow().clone_data(),
-        port_pixels.get(&(4, 5)).unwrap().borrow().clone_data(),
-    );
+        assert_ne!(
+            port_pixels.get(&(2, 1)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(4, 1)).unwrap().borrow().clone_data(),
+        );
+
+        assert_ne!(
+            port_pixels.get(&(1, 2)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(1, 4)).unwrap().borrow().clone_data(),
+        );
+
+        assert_ne!(
+            port_pixels.get(&(5, 2)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(5, 4)).unwrap().borrow().clone_data(),
+        );
+
+        assert_ne!(
+            port_pixels.get(&(2, 5)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(4, 5)).unwrap().borrow().clone_data(),
+        );
+
+        assert_pixels_eq!(modified_skeleton_image, skeleton_image)
+    }
+    {
+        let skeleton_image = gray_image!(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0;
+            0, 0, 0, E, E, E, E, E, E, E, 0, 0, 0;
+            0, 0, 0, P, 0, 0, 0, 0, 0, P, 0, 0, 0;
+            0, E, P, F, P, E, 0, 0, 0, F, P, E, 0;
+            0, E, 0, 0, 0, E, 0, 0, 0, P, 0, E, 0;
+            0, E, 0, 0, 0, C, E, C, E, E, 0, E, 0;
+            0, E, 0, 0, 0, E, 0, E, 0, 0, 0, E, 0;
+            0, E, 0, E, E, C, E, C, 0, 0, 0, E, 0;
+            0, E, 0, P, 0, 0, 0, E, 0, 0, 0, E, 0;
+            0, E, P, F, 0, 0, 0, E, P, F, P, E, 0;
+            0, 0, 0, P, 0, 0, 0, 0, 0, P, 0, 0, 0;
+            0, 0, 0, E, E, E, E, E, E, E, 0, 0, 0;
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        );
+
+        let port_pixels = hashmap!(
+            (2, 3) => RefCell::new(UnionFindNode::new(1)),
+            (4, 3) => RefCell::new(UnionFindNode::new(2)),
+            (3, 2) => RefCell::new(UnionFindNode::new(3)),
+
+            (9, 2) => RefCell::new(UnionFindNode::new(4)),
+            (9, 4) => RefCell::new(UnionFindNode::new(5)),
+            (10, 3) => RefCell::new(UnionFindNode::new(6)),
+
+            (3, 8) => RefCell::new(UnionFindNode::new(7)),
+            (3, 10) => RefCell::new(UnionFindNode::new(8)),
+            (2, 9) => RefCell::new(UnionFindNode::new(9)),
+
+            (8, 9) => RefCell::new(UnionFindNode::new(10)),
+            (10, 9) => RefCell::new(UnionFindNode::new(11)),
+            (9, 10) => RefCell::new(UnionFindNode::new(12)),
+        );
+
+        let (modified_skeleton_image, port_pixels) =
+            unify_port_pixels(skeleton_image.clone(), port_pixels, 2).unwrap();
+
+        assert_eq!(
+            port_pixels.get(&(2, 3)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(4, 3)).unwrap().borrow().clone_data(),
+        );
+        assert_eq!(
+            port_pixels.get(&(4, 3)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(3, 2)).unwrap().borrow().clone_data(),
+        );
+        assert_eq!(
+            port_pixels.get(&(3, 2)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(5, 5)).unwrap().borrow().clone_data(),
+        );
+
+        assert_eq!(
+            port_pixels.get(&(9, 2)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(9, 4)).unwrap().borrow().clone_data(),
+        );
+        assert_eq!(
+            port_pixels.get(&(9, 4)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(10, 3)).unwrap().borrow().clone_data(),
+        );
+        assert_eq!(
+            port_pixels.get(&(10, 3)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(7, 5)).unwrap().borrow().clone_data(),
+        );
+
+        assert_eq!(
+            port_pixels.get(&(3, 8)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(3, 10)).unwrap().borrow().clone_data(),
+        );
+        assert_eq!(
+            port_pixels.get(&(3, 10)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(2, 9)).unwrap().borrow().clone_data(),
+        );
+        assert_eq!(
+            port_pixels.get(&(2, 9)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(5, 7)).unwrap().borrow().clone_data(),
+        );
+
+        assert_eq!(
+            port_pixels.get(&(8, 9)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(10, 9)).unwrap().borrow().clone_data(),
+        );
+        assert_eq!(
+            port_pixels.get(&(10, 9)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(9, 10)).unwrap().borrow().clone_data(),
+        );
+        assert_eq!(
+            port_pixels.get(&(9, 10)).unwrap().borrow().clone_data(),
+            port_pixels.get(&(7, 7)).unwrap().borrow().clone_data(),
+        );
+
+        let expected_skeleton_image = gray_image!(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0;
+            0, 0, 0, E, E, E, E, E, E, E, 0, 0, 0;
+            0, 0, 0, P, 0, 0, 0, 0, 0, P, 0, 0, 0;
+            0, E, P, F, P, E, 0, 0, 0, F, P, E, 0;
+            0, E, 0, 0, 0, E, 0, 0, 0, P, 0, E, 0;
+            0, E, 0, 0, 0, P, E, P, E, E, 0, E, 0;
+            0, E, 0, 0, 0, E, 0, E, 0, 0, 0, E, 0;
+            0, E, 0, E, E, P, E, P, 0, 0, 0, E, 0;
+            0, E, 0, P, 0, 0, 0, E, 0, 0, 0, E, 0;
+            0, E, P, F, 0, 0, 0, E, P, F, P, E, 0;
+            0, 0, 0, P, 0, 0, 0, 0, 0, P, 0, 0, 0;
+            0, 0, 0, E, E, E, E, E, E, E, 0, 0, 0;
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        );
+
+        assert_pixels_eq!(modified_skeleton_image, expected_skeleton_image)
+    }
 }
 
 fn calculate_adjacency_map(
@@ -502,64 +694,71 @@ fn calculate_adjacency_map(
     let mut visited = HashSet::new();
 
     for (_, port_pixel_node) in port_pixels {
-        let port_pixel_index = port_pixel_node.borrow().clone_data();
+        let port_pixel_id = port_pixel_node.borrow().clone_data();
 
-        if !adjacency_list.contains_key(&port_pixel_index) {
-            adjacency_list.insert(port_pixel_index, RefCell::new(HashMap::new()));
+        if !adjacency_list.contains_key(&port_pixel_id) {
+            adjacency_list.insert(port_pixel_id, RefCell::new(HashMap::new()));
         }
     }
 
     for (src_pixel, src_pixel_node) in port_pixels {
-        if visited.contains(src_pixel) {
-            continue;
-        }
-
         visited.insert(*src_pixel);
 
-        let src_pixel_index = src_pixel_node.borrow().clone_data();
-        let mut src_adjacents = adjacency_list.get(&src_pixel_index).unwrap().borrow_mut();
+        let src_pixel_id = src_pixel_node.borrow().clone_data();
+        let mut src_adjacents = adjacency_list.get(&src_pixel_id).unwrap().borrow_mut();
 
-        let mut prev_pixel = *src_pixel;
-        let mut current_pixel = *src_pixel;
+        for port_pixel_neighbor in &four_neighbors(&skeleton_image, src_pixel.0, src_pixel.1) {
+            if !(port_pixel_neighbor.1 == EDGE_PIXEL || port_pixel_neighbor.1 == PORT_PIXEL) {
+                continue;
+            }
 
-        loop {
-            let mut moved = false;
+            let mut current_pixel = port_pixel_neighbor.0;
+            let mut prev_pixel = *src_pixel;
 
-            for neighbor in &four_neighbors(&skeleton_image, current_pixel.0, current_pixel.1) {
-                if neighbor.0 != prev_pixel
-                    && (neighbor.1 == EDGE_PIXEL || neighbor.1 == PORT_PIXEL)
-                {
-                    prev_pixel = current_pixel;
-                    current_pixel = neighbor.0;
+            loop {
+                if skeleton_image.get_pixel(current_pixel.0, current_pixel.1)[0] == PORT_PIXEL {
+                    if visited.contains(&current_pixel) {
+                        break;
+                    }
 
-                    moved = true;
+                    let dst_pixel_id = port_pixels
+                        .get(&current_pixel)
+                        .unwrap()
+                        .borrow()
+                        .clone_data();
+
+                    if dst_pixel_id == src_pixel_id {
+                        break;
+                    }
+
+                    let mut dst_adjacents = adjacency_list.get(&dst_pixel_id).unwrap().borrow_mut();
+
+                    *(src_adjacents.entry(dst_pixel_id).or_insert(0)) += 1;
+                    *(dst_adjacents.entry(src_pixel_id).or_insert(0)) += 1;
+
                     break;
                 }
-            }
 
-            if !moved {
-                return Err(format!("dead end edge on pixel: {:?}", current_pixel));
-            }
+                let mut moved = false;
 
-            if skeleton_image.get_pixel(current_pixel.0, current_pixel.1)[0] == PORT_PIXEL {
-                visited.insert(current_pixel);
+                for neighbor in &four_neighbors(&skeleton_image, current_pixel.0, current_pixel.1) {
+                    if neighbor.0 != prev_pixel
+                        && (neighbor.1 == EDGE_PIXEL || neighbor.1 == PORT_PIXEL)
+                    {
+                        prev_pixel = current_pixel;
+                        current_pixel = neighbor.0;
 
-                let dst_pixel_index = port_pixels
-                    .get(&current_pixel)
-                    .unwrap()
-                    .borrow()
-                    .clone_data();
-
-                if dst_pixel_index == src_pixel_index {
-                    return Err(format!("there is a loop on vertex: {:?}", current_pixel));
+                        moved = true;
+                        break;
+                    }
                 }
 
-                let mut dst_adjacents = adjacency_list.get(&dst_pixel_index).unwrap().borrow_mut();
-
-                *(src_adjacents.entry(dst_pixel_index).or_insert(0)) += 1;
-                *(dst_adjacents.entry(src_pixel_index).or_insert(0)) += 1;
-
-                break;
+                if !moved {
+                    return Err(format!(
+                        "calculate_adjacency_map: dead end edge on pixel: {:?}",
+                        current_pixel
+                    ));
+                }
             }
         }
     }
@@ -578,18 +777,22 @@ fn four_neighbors(image: &GrayImage, x: u32, y: u32) -> FourNeighbors {
 
 #[test]
 fn calculate_adjacency_map_test() {
+    const F: u8 = FOREGROUND_PIXEL;
+    const P: u8 = PORT_PIXEL;
+    const E: u8 = EDGE_PIXEL;
+
     {
         let skeleton_image = gray_image!(
-            0, 0,                0,          0,          0,          0,                0;
-            0, FOREGROUND_PIXEL, PORT_PIXEL, EDGE_PIXEL, PORT_PIXEL, FOREGROUND_PIXEL, 0;
-            0, PORT_PIXEL,       0,          0,          0,          PORT_PIXEL,       0;
-            0, EDGE_PIXEL,       0,          0,          0,          EDGE_PIXEL,       0;
-            0, PORT_PIXEL,       0,          0,          0,          PORT_PIXEL,       0;
-            0, FOREGROUND_PIXEL, PORT_PIXEL, EDGE_PIXEL, PORT_PIXEL, FOREGROUND_PIXEL, 0;
-            0, 0,                0,          0,          0,          0,                0
+            0, 0, 0, 0, 0, 0, 0;
+            0, F, P, E, P, F, 0;
+            0, P, 0, 0, 0, P, 0;
+            0, E, 0, 0, 0, E, 0;
+            0, P, 0, 0, 0, P, 0;
+            0, F, P, E, P, F, 0;
+            0, 0, 0, 0, 0, 0, 0
         );
 
-        let mut port_pixels = hashmap!(
+        let port_pixels = hashmap!(
             (2, 1) => RefCell::new(UnionFindNode::new(1)),
             (1, 2) => RefCell::new(UnionFindNode::new(1)),
             (4, 1) => RefCell::new(UnionFindNode::new(2)),
@@ -620,26 +823,26 @@ fn calculate_adjacency_map_test() {
         );
 
         assert_eq!(
-            expected_adjacency_map,
-            calculate_adjacency_map(&skeleton_image, &port_pixels).unwrap()
+            calculate_adjacency_map(&skeleton_image, &port_pixels).unwrap(),
+            expected_adjacency_map
         )
     }
     {
         let skeleton_image = gray_image!(
-            0, 0,                0,                0,                0,          0,          0,          0,                0,                0,                0;
-            0, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, PORT_PIXEL, EDGE_PIXEL, PORT_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0;
-            0, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0,          0,          0,          FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0;
-            0, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, PORT_PIXEL, EDGE_PIXEL, PORT_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0;
-            0, PORT_PIXEL,       0,                PORT_PIXEL,       0,          0,          0,          PORT_PIXEL,       0,                PORT_PIXEL,       0;
-            0, EDGE_PIXEL,       0,                EDGE_PIXEL,       0,          0,          0,          EDGE_PIXEL,       0,                EDGE_PIXEL,       0;
-            0, PORT_PIXEL,       0,                PORT_PIXEL,       0,          0,          0,          PORT_PIXEL,       0,                PORT_PIXEL,       0;
-            0, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, PORT_PIXEL, EDGE_PIXEL, PORT_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0;
-            0, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0,          0,          0,          FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0;
-            0, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, PORT_PIXEL, EDGE_PIXEL, PORT_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, FOREGROUND_PIXEL, 0;
-            0, 0,                0,                0,                0,          0,          0,          0,                0,                0,                0
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0;
+            0, F, F, F, P, E, P, F, F, F, 0;
+            0, F, F, F, 0, 0, 0, F, F, F, 0;
+            0, F, F, F, P, E, P, F, F, F, 0;
+            0, P, 0, P, 0, 0, 0, P, 0, P, 0;
+            0, E, 0, E, 0, 0, 0, E, 0, E, 0;
+            0, P, 0, P, 0, 0, 0, P, 0, P, 0;
+            0, F, F, F, P, E, P, F, F, F, 0;
+            0, F, F, F, 0, 0, 0, F, F, F, 0;
+            0, F, F, F, P, E, P, F, F, F, 0;
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
         );
 
-        let mut port_pixels = hashmap!(
+        let port_pixels = hashmap!(
             (4, 1) => RefCell::new(UnionFindNode::new(1)),
             (4, 3) => RefCell::new(UnionFindNode::new(1)),
             (1, 4) => RefCell::new(UnionFindNode::new(1)),
@@ -683,6 +886,69 @@ fn calculate_adjacency_map_test() {
         assert_eq!(
             expected_adjacency_map,
             calculate_adjacency_map(&skeleton_image, &port_pixels).unwrap()
+        )
+    }
+    {
+        let skeleton_image = gray_image!(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0;
+            0, 0, 0, E, E, E, E, E, E, E, 0, 0, 0;
+            0, 0, 0, P, 0, 0, 0, 0, 0, P, 0, 0, 0;
+            0, E, P, F, P, E, 0, 0, 0, F, P, E, 0;
+            0, E, 0, 0, 0, E, 0, 0, 0, P, 0, E, 0;
+            0, E, 0, 0, 0, P, E, P, E, E, 0, E, 0;
+            0, E, 0, 0, 0, E, 0, E, 0, 0, 0, E, 0;
+            0, E, 0, E, E, P, E, P, 0, 0, 0, E, 0;
+            0, E, 0, P, 0, 0, 0, E, 0, 0, 0, E, 0;
+            0, E, P, F, 0, 0, 0, E, P, F, P, E, 0;
+            0, 0, 0, P, 0, 0, 0, 0, 0, P, 0, 0, 0;
+            0, 0, 0, E, E, E, E, E, E, E, 0, 0, 0;
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        );
+
+        let port_pixels = hashmap!(
+            (2, 3) => RefCell::new(UnionFindNode::new(1)),
+            (4, 3) => RefCell::new(UnionFindNode::new(1)),
+            (3, 2) => RefCell::new(UnionFindNode::new(1)),
+            (5, 5) => RefCell::new(UnionFindNode::new(1)),
+
+            ( 9, 2) => RefCell::new(UnionFindNode::new(2)),
+            ( 9, 4) => RefCell::new(UnionFindNode::new(2)),
+            (10, 3) => RefCell::new(UnionFindNode::new(2)),
+            ( 7, 5) => RefCell::new(UnionFindNode::new(2)),
+
+            (3,  8) => RefCell::new(UnionFindNode::new(3)),
+            (3, 10) => RefCell::new(UnionFindNode::new(3)),
+            (2,  9) => RefCell::new(UnionFindNode::new(3)),
+            (5,  7) => RefCell::new(UnionFindNode::new(3)),
+
+            ( 8,  9) => RefCell::new(UnionFindNode::new(4)),
+            (10,  9) => RefCell::new(UnionFindNode::new(4)),
+            ( 9, 10) => RefCell::new(UnionFindNode::new(4)),
+            ( 7,  7) => RefCell::new(UnionFindNode::new(4)),
+        );
+
+        let expected_adjacency_map = hashmap!(
+            1 => RefCell::new(hashmap!(
+                2 => 2,
+                3 => 2,
+            )),
+            2 => RefCell::new(hashmap!(
+                1 => 2,
+                4 => 2,
+            )),
+            3 => RefCell::new(hashmap!(
+                1 => 2,
+                4 => 2,
+            )),
+            4 => RefCell::new(hashmap!(
+                2 => 2,
+                3 => 2,
+            )),
+        );
+
+        assert_eq!(
+            calculate_adjacency_map(&skeleton_image, &port_pixels).unwrap(),
+            expected_adjacency_map
         )
     }
 }
